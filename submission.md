@@ -111,7 +111,97 @@ pre-rendered message string. The sharer sees it through
 **Side-effect check** — ...
 -->
 
-_(To be written during Milestone 3, one entry per fix.)_
+### Issue #1 — My listening streak keeps resetting
+
+**How I reproduced it** — This bug only shows up on the live endpoint on an actual
+Sunday (today is a Wednesday), so I reproduced it at the function level instead, the way
+the project hints suggest: I called `update_listening_streak()` directly with controlled
+dates — a Saturday (2024-06-15), then the following Sunday, then Monday. After Saturday
+the streak was 1; after Sunday it was still 1 even though the days are consecutive
+(expected 2); after Monday it went to 2, which matches kenji's report of the streak
+"counting again" from 1 the day after it got wiped. The condition that triggers it is
+simply that the consecutive-day listen lands on a Sunday. The repo's own test
+`test_streak_increments_on_sunday` fails on exactly this scenario (`assert 1 == 2`), so
+`pytest tests/test_streaks.py` reproduces it too.
+
+**How I found the root cause** — _(Milestone 3)_
+
+**The root cause** — _(Milestone 3)_
+
+**My fix** — _(Milestone 3)_
+
+**Side-effect check** — _(Milestone 3)_
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it** — The trigger condition is a friend whose most recent listen was
+yesterday evening, i.e. less than 24 hours ago but on the previous calendar day. The
+seeded events are all stamped at seed time, so I inserted one extra `ListeningEvent` for
+aaliya timestamped yesterday at 23:00 UTC and then requested
+`GET /feed/<kenji_id>/listening-now` (kenji and aaliya are friends). At 07:27 UTC today,
+aaliya appeared in kenji's "listening now" feed with the yesterday-23:00 timestamp —
+exactly nova's complaint that a friend who last listened the previous evening still hangs
+around the feed the next morning.
+
+**How I found the root cause** — _(Milestone 3)_
+
+**The root cause** — _(Milestone 3)_
+
+**My fix** — _(Milestone 3)_
+
+**Side-effect check** — _(Milestone 3)_
+
+### Issue #4 — Notified on playlist add but not on rating
+
+**How I reproduced it** — With fresh seed data, nova has exactly one notification (the
+seeded `song_added_to_playlist` one). I had kenji rate nova's shared song "Midnight
+Drive" via `POST /songs/<song_id>/rate` with `{"user_id": <kenji_id>, "score": 5}` — it
+returned 201 and the rating was saved. Then `GET /users/<nova_id>/notifications` still
+returned only the one playlist-add notification: no notification of type `song_rated`
+exists anywhere. So the rating persists (matching "it shows on the song") but no
+notification is ever created, for any rater — the omission is unconditional, which
+matches aaliya saying it happens "for anyone I've asked."
+
+**How I found the root cause** — _(Milestone 3)_
+
+**The root cause** — _(Milestone 3)_
+
+**My fix** — _(Milestone 3)_
+
+**Side-effect check** — _(Milestone 3)_
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it** — Fresh seed data puts 7 songs into "Friday Energy" (7 rows in
+`playlist_entries`), but `GET /playlists/<id>/songs` returns `count: 6`. The missing song
+is "Harlem Renaissance" — the entry with the highest `position`. To confirm darius's
+observation that adding a song "frees" the previously hidden one, I inserted "Still
+Waters" at position 8 and re-fetched: the count became 7, "Harlem Renaissance" appeared,
+and "Still Waters" — now the most recently added song — became the hidden one. The
+playlist tests fail on the same behavior (`test_playlist_returns_all_songs` expects 5
+songs and gets 4). One honest caveat: I had to insert the new row directly into the
+database, because `POST /playlists/<id>/songs` currently crashes with a 500
+(`IntegrityError`: `playlist_entries.position` is NOT NULL) — that is a separate defect
+from this issue, so reproducing "the last song is hidden" required bypassing it.
+
+**How I found the root cause** — _(Milestone 3)_
+
+**The root cause** — _(Milestone 3)_
+
+**My fix** — _(Milestone 3)_
+
+**Side-effect check** — _(Milestone 3)_
+
+### Issue #3 — The same song shows up twice in search (could not reproduce)
+
+I made a genuine attempt at this one before setting it aside. `GET /songs/search?q=Anthem`
+returns "Crown Heights Anthem" exactly once, even though that song has 3 tags and the
+issue report says it appeared three times. A broad query matching all 13 seeded songs
+returned no duplicated titles at all, and the repo's own
+`test_search_no_duplicates_multi_tag_song` passes against the current code. Following the
+project guidance ("if you can't reproduce it, you don't understand what's wrong yet ...
+try a different one"), I chose issues #1, #2, #4, and #5 instead. I may revisit this as a
+stretch goal to explain *why* the reported symptom doesn't manifest.
 
 ## Git Log
 
