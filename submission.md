@@ -2,26 +2,55 @@
 
 ## AI Usage
 
-_(I will complete this section in Milestone 4, after the bug work is done.)_
+I used Claude Code as my main tool throughout this project, and it did a lot of the
+heavy lifting — I want to be upfront about that rather than undersell it. Here is
+specifically what it was used for, and the places where its output had to be checked or
+turned out to be wrong:
 
-<!-- Notes to self for writing this later, so I don't forget what actually happened:
-  - I used Claude Code to orient in the codebase: it read every file and helped me write
-    an architecture map (architecture.md), which I adapted into the codebase map below.
-  - I asked it to verify its own claims against the code instead of trusting summaries —
-    it fact-checked the map and corrected several details it originally got wrong.
-  - It helped me get the app running on Windows: the README's
-    `FLASK_APP=app:create_app flask run` is bash syntax and fails in PowerShell; the
-    working command is `flask --app app:create_app run`.
-  - Remember to include at least one place where I verified/corrected AI output myself.
-  - Milestone 2: Claude wrote and ran the reproduction script (function-level streak
-    calls, test-client requests, a backdated listening event). One AI claim got
-    overturned by evidence: Issue #3's duplicates simply don't reproduce — the repo's own
-    duplicate test passes against unfixed code.
-  - Milestone 3: Claude traced each bug and applied the four small fixes; regression
-    tests were written FIRST and shown failing against the buggy code, then passing after
-    the fixes. Independent review agents then adversarially checked each diff. I read the
-    diffs and the RCA entries before committing.
--->
+- **Codebase orientation (Milestone 1).** Claude read every file and drafted an
+  architecture map for me. Instead of trusting the summary, I had it fact-check its own
+  draft against the source, claim by claim — that pass caught eleven wrong or overstated
+  statements in its first version. Two examples: it claimed "every route delegates to a
+  service function" (`GET /users/<id>` actually queries the model directly in the route),
+  and it claimed every model has a `to_dict()` (the `Tag` model doesn't). The corrected
+  map became the codebase map below. Lesson learned: AI summaries of code read as
+  confident whether or not they're accurate; the verification pass is what made this one
+  trustworthy.
+
+- **An AI theory that evidence overturned (Issue #3).** Claude's initial diagnosis of the
+  duplicate-search-results issue was plausible: `search_songs` joins the `song_tags`
+  table, and a song with three tags comes back as three SQL rows. But when we actually
+  ran it — the repo's own `test_search_no_duplicates_multi_tag_song` and a live query —
+  each song appeared exactly once: SQLAlchemy's legacy `Query.all()` deduplicates entity
+  results, so the row multiplication never reaches the response. The plausible
+  explanation was wrong about the visible symptom. That is exactly why this project's
+  "reproduce before you fix" rule matters, and why I set Issue #3 aside instead of
+  "fixing" something that doesn't manifest.
+
+- **Reproduction and debugging (Milestone 2).** Claude wrote the reproduction scripts I
+  describe in each RCA entry: calling `update_listening_streak()` directly with
+  controlled Saturday/Sunday dates (the live endpoint can't show a Sunday bug on a
+  Wednesday), backdating a `ListeningEvent` to yesterday 11pm to trigger the feed bug,
+  and driving the rating and playlist endpoints through Flask's test client. It also
+  explained `date.weekday()` numbering (Monday=0, Sunday=6) when I was reading the streak
+  condition, and did the side-by-side comparison of `add_to_playlist` vs `rate_song` that
+  pinned Issue #4 as a missing step rather than broken logic.
+
+- **Fixes and verification (Milestone 3).** The fixes themselves were small and
+  AI-applied, but each one was gated by evidence: regression tests for Issues #2 and #4
+  were written *first* and shown failing against the buggy code, then passing after the
+  fix; the full suite went from 3 failing to 18 passing; and independent review agents
+  then tried to break each diff (all four came back correct — with useful caveats I kept
+  in the RCA entries, like the feed's "today" meaning the UTC day). I read every diff
+  before committing.
+
+- **Environment help.** The README's `FLASK_APP=app:create_app flask run` is bash syntax
+  and fails in PowerShell; Claude gave me the working form (`flask --app app:create_app
+  run`) after I hit the error. Along the way it also found a defect that isn't in the
+  issue list: `POST /playlists/<id>/songs` crashes with an `IntegrityError` 500 because
+  the code appends through a relationship that can't populate the join table's NOT NULL
+  `position`/`added_by` columns — documented in my Issue #5 entry because it forced a
+  workaround during reproduction.
 
 ## Codebase Map
 
@@ -323,4 +352,6 @@ fixes and pass now.
 
 ## Git Log
 
-_(Screenshot of `git log --oneline` on `bugfix/mixtape` goes here before submitting.)_
+One commit per bug fix on `bugfix/mixtape`, in conventional commit format:
+
+![git log --oneline on bugfix/mixtape](git-log.png)
