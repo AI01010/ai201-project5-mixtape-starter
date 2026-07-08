@@ -13,6 +13,14 @@ _(I will complete this section in Milestone 4, after the bug work is done.)_
     `FLASK_APP=app:create_app flask run` is bash syntax and fails in PowerShell; the
     working command is `flask --app app:create_app run`.
   - Remember to include at least one place where I verified/corrected AI output myself.
+  - Milestone 2: Claude wrote and ran the reproduction script (function-level streak
+    calls, test-client requests, a backdated listening event). One AI claim got
+    overturned by evidence: Issue #3's duplicates simply don't reproduce — the repo's own
+    duplicate test passes against unfixed code.
+  - Milestone 3: Claude traced each bug and applied the four small fixes; regression
+    tests were written FIRST and shown failing against the buggy code, then passing after
+    the fixes. Independent review agents then adversarially checked each diff. I read the
+    diffs and the RCA entries before committing.
 -->
 
 ## Codebase Map
@@ -124,13 +132,35 @@ simply that the consecutive-day listen lands on a Sunday. The repo's own test
 `test_streak_increments_on_sunday` fails on exactly this scenario (`assert 1 == 2`), so
 `pytest tests/test_streaks.py` reproduces it too.
 
-**How I found the root cause** — _(Milestone 3)_
+**How I found the root cause** — I started from the read side: `GET /users/<user_id>/streak`
+calls `get_streak()`, which just returns the stored `user.listening_streak` with no date
+math at all. So the wrong number had to be *written*, not misread. The only code that
+writes the streak is `record_listening_event()` → `update_listening_streak()` in
+`services/streak_service.py`. Reading that function's branches, the increment case stood
+out: `elif days_since_last == 1 and today.weekday() != 6:` — nothing else in the function
+cares about weekdays, and the bug report was weekday-specific. I checked Python's docs to
+be sure: `date.weekday()` numbers Monday as 0 and Sunday as 6. The moment I was confident
+was stepping through the function with a Saturday date followed by a Sunday date and
+watching control skip the increment and land in the reset branch instead.
 
-**The root cause** — _(Milestone 3)_
+**The root cause** — Python's `weekday()` returns 6 for Sunday, and the increment branch
+required `today.weekday() != 6`. So a listen on a Sunday — even exactly one day after the
+previous listen — failed that condition and fell through to the `else`, which set the
+streak back to 1. The function still updated `last_listened_at` afterward, which is why
+kenji saw it "counting again": Monday's listen found `days_since_last == 1` (and Monday's
+weekday is 0), so it incremented the already-wrecked streak from 1 to 2. A consecutive-day
+streak depends only on the gap between calendar days — the day of the week has no business
+in that comparison — so the correct condition is `days_since_last == 1` alone.
 
-**My fix** — _(Milestone 3)_
+**My fix** — Removed the `and today.weekday() != 6` clause, leaving
+`elif days_since_last == 1:`. One line; no other logic touched.
 
-**Side-effect check** — _(Milestone 3)_
+**Side-effect check** — The change only widens the increment condition, but I still ran
+the whole streak suite (5/5 pass) to confirm the neighboring rules survived: a first
+listen starts at 1, listening twice in one day doesn't double-count, and a skipped day
+still resets to 1. I also stepped a user through Saturday → Sunday → Monday → Monday again
+→ a skipped day and got 1, 2, 3, 3, 1 — the streak now crosses the weekend boundary, and
+the reset still fires when a day is genuinely missed.
 
 ### Issue #2 — Friends Listening Now shows people from yesterday
 
@@ -143,13 +173,36 @@ aaliya appeared in kenji's "listening now" feed with the yesterday-23:00 timesta
 exactly nova's complaint that a friend who last listened the previous evening still hangs
 around the feed the next morning.
 
-**How I found the root cause** — _(Milestone 3)_
+**How I found the root cause** — From `routes/feed.py` into
+`feed_service.get_friends_listening_now()`. The recency filter is
+`ListeningEvent.listened_at >= cutoff` with
+`cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`, where `RECENT_THRESHOLD` is a
+module constant equal to 24 hours. The giveaway was in nova's own report: stale entries
+disappear "at the same time the next day". That is the fingerprint of a window that slides
+with the query time instead of resetting at midnight. My inserted yesterday-23:00 event
+passing the filter at 07:27 UTC confirmed it — the event was only 8.5 hours old, so it was
+inside the 24-hour window, just on the wrong calendar day.
 
-**The root cause** — _(Milestone 3)_
+**The root cause** — The feature's contract is "friends who have listened today", but the
+code implemented "friends who listened in the last 24 hours". `now - 24h` never aligns
+with a day boundary, so an 11pm listen stays visible until 11pm the following day — all
+morning, even though the friend hasn't opened the app. Correct behavior requires a fixed
+boundary (the start of the current day), not a distance measured from whenever you happen
+to ask.
 
-**My fix** — _(Milestone 3)_
+**My fix** — Replaced the cutoff with the start of the current UTC day:
+`datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)`, deleted
+the now-unused `RECENT_THRESHOLD` constant and `timedelta` import, and updated the
+docstring from "recently" to "today". One semantic decision worth recording: "today" means
+the UTC day, consistent with every timestamp this app stores.
 
-**Side-effect check** — _(Milestone 3)_
+**Side-effect check** — The constant was used in exactly one place; `get_activity_feed()`
+has no recency filter at all, and after the fix I verified the activity feed still returns
+yesterday's events, because "not filtered by recency" is that function's documented
+behavior — that's the code path most plausibly affected by a change in this file, and it
+isn't. The per-friend dedup logic is untouched. My regression tests cover both sides of
+the boundary: a listen at 00:01 today appears, a listen at 23:00 yesterday does not
+(`tests/test_feed.py`). Full suite passes 18/18.
 
 ### Issue #4 — Notified on playlist add but not on rating
 
@@ -162,13 +215,38 @@ exists anywhere. So the rating persists (matching "it shows on the song") but no
 notification is ever created, for any rater — the omission is unconditional, which
 matches aaliya saying it happens "for anyone I've asked."
 
-**How I found the root cause** — _(Milestone 3)_
+**How I found the root cause** — The issue report hands you a working feature to compare
+against, so I put the two flows side by side — they both live in
+`services/notification_service.py`. `add_to_playlist()` ends by calling
+`create_notification(user_id=song.shared_by, ...)`, guarded by
+`song.shared_by != added_by_user_id`. `rate_song()` validates the score, upserts the
+`Rating` row, commits… and returns. No `create_notification` call — it never even reads
+`song.shared_by`. To rule out the other explanation (notifications created but not shown),
+I read `get_notifications()`: it filters only by `user_id` and the `read` flag, so there
+is no type filter that could hide rating notifications. I also searched the repo for any
+other place that constructs a `Notification`; there is none besides `create_notification`
+itself. That closed the case: nothing creates them, nothing could.
 
-**The root cause** — _(Milestone 3)_
+**The root cause** — A missing step rather than broken logic: the notification half of
+rating was never implemented. The route → `rate_song()` path stores the rating and stops.
+Since `create_notification` is the only way notifications come into existence and
+`rate_song` never calls it, "rating notifications just don't happen, for anyone" is
+exactly what the code guarantees. This is the architectural cause the hint pointed at: the
+working feature bundles "do the action, then notify the sharer" in one service function,
+and the rating action only ever got the first half.
 
-**My fix** — _(Milestone 3)_
+**My fix** — Added the same pattern `add_to_playlist` uses, right after the rating
+commit: if `song.shared_by != user_id`, call `create_notification()` with type
+`song_rated` and a body like `kenji rated your song 'Midnight Drive' 5/5.` The guard means
+you are not notified for rating your own song, mirroring the playlist-add behavior.
 
-**Side-effect check** — _(Milestone 3)_
+**Side-effect check** — New tests in `tests/test_notifications.py` pin the behavior: the
+sharer receives the notification, a self-rating produces none, and the rating itself still
+persists with the right score. Through the endpoint I confirmed the untouched validation
+still rejects out-of-range scores with a 400, `mark_as_read` still works, and re-rating
+updates the existing row (the unique-constraint path) while notifying again — consistent
+with how playlist re-adds behave. I did not touch `add_to_playlist`, and the seeded
+playlist-add notification still reads back correctly.
 
 ### Issue #5 — The last song in a playlist never shows up
 
@@ -184,13 +262,32 @@ database, because `POST /playlists/<id>/songs` currently crashes with a 500
 (`IntegrityError`: `playlist_entries.position` is NOT NULL) — that is a separate defect
 from this issue, so reproducing "the last song is hidden" required bypassing it.
 
-**How I found the root cause** — _(Milestone 3)_
+**How I found the root cause** — From `GET /playlists/<id>/songs` in
+`routes/playlists.py` into `playlist_service.get_playlist_songs()`. The query itself
+looked right: join `playlist_entries`, filter by playlist ID, order by `asc(position)`.
+Then the return line: `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slices
+off the last element of a list that was just sorted by position — and the docstring a few
+lines above says "This function returns all songs in the playlist," so the code
+contradicts its own contract. What made me certain rather than just suspicious: the
+database had 7 rows for "Friday Energy", the endpoint returned 6, and the missing song was
+precisely the highest-position entry — the one element `[:-1]` on an ascending list is
+guaranteed to drop.
 
-**The root cause** — _(Milestone 3)_
+**The root cause** — The song list is ordered by ascending `position`, and positions are
+assigned incrementally as songs are added, so the final element is always the most
+recently added song. `songs[:-1]` therefore always hides exactly that one. It also
+explains darius's "freeing" observation: adding a song at position N+1 means the old
+position-N entry is no longer last, so it reappears — and the new song takes its place as
+the hidden one.
 
-**My fix** — _(Milestone 3)_
+**My fix** — Removed the slice: `return [song.to_dict() for song in songs]`.
 
-**Side-effect check** — _(Milestone 3)_
+**Side-effect check** — All three playlist tests pass, including the empty-playlist case,
+which is worth calling out: `[][:-1]` is also `[]`, so empty playlists behaved correctly
+even with the bug, and the fix keeps that path identical. After reseeding I fetched the
+endpoint again: all 7 songs, still in position order, first song unchanged. I also checked
+that nothing else calls `get_playlist_songs`, so no other feature could have been relying
+on the truncated list.
 
 ### Issue #3 — The same song shows up twice in search (could not reproduce)
 
@@ -202,6 +299,27 @@ returned no duplicated titles at all, and the repo's own
 project guidance ("if you can't reproduce it, you don't understand what's wrong yet ...
 try a different one"), I chose issues #1, #2, #4, and #5 instead. I may revisit this as a
 stretch goal to explain *why* the reported symptom doesn't manifest.
+
+## Stretch: Regression Tests
+
+I wrote regression tests for the two fixed issues that had no existing coverage, and ran
+them before and after the fix to prove they catch the bug:
+
+- `tests/test_feed.py::test_friend_from_yesterday_evening_does_not_appear` (Issue #2) —
+  seeds a friend whose only listen is yesterday at 23:00 UTC and asserts the "listening
+  now" feed is empty. Against the buggy code this **fails**, because a yesterday-evening
+  listen is less than 24 hours old and passed the rolling-window filter; after the fix it
+  passes. A companion test asserts a listen at 00:01 today *does* appear, so the fix
+  can't silently over-filter.
+- `tests/test_notifications.py::test_rating_notifies_the_sharer` (Issue #4) — has one
+  user rate another user's shared song and asserts a `song_rated` notification exists for
+  the sharer. Against the buggy code this **fails** (no notification was ever created);
+  after the fix it passes. Companion tests pin the guard (no self-notification) and that
+  the rating itself still saves.
+
+Issues #1 and #5 already had tests that would have caught them
+(`test_streak_increments_on_sunday` and the two playlist tests) — those failed before my
+fixes and pass now.
 
 ## Git Log
 

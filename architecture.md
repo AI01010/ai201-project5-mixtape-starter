@@ -35,7 +35,7 @@ always in the service it delegates to.
 | `routes/users.py` | `GET /users/<id>`, `GET /users/<id>/streak`, `GET /users/<id>/notifications`, `POST /users/notifications/<id>/read`. |
 | `routes/feed.py` | `GET /feed/<id>/listening-now`, `GET /feed/<id>/activity`. |
 | `services/streak_service.py` | Records `ListeningEvent`s and maintains `User.listening_streak` / `User.last_listened_at`. Streaks are computed **at write time** and stored on the user row — `get_streak` just reads the stored integer. |
-| `services/feed_service.py` | "Friends Listening Now" (recency-filtered, deduplicated to one most-recent song per friend, cutoff = `RECENT_THRESHOLD`) and the activity feed (last N events, no recency filter). |
+| `services/feed_service.py` | "Friends Listening Now" (current-UTC-day listens only, deduplicated to one most-recent song per friend) and the activity feed (last N events, no recency filter). |
 | `services/search_service.py` | Case-insensitive `ilike` search over `Song.title` / `Song.artist`; also `get_song`. |
 | `services/notification_service.py` | Creating/reading/marking notifications — **and also** two interaction actions that may trigger them: `add_to_playlist` and `rate_song`. |
 | `services/playlist_service.py` | Playlist creation and retrieval; `get_playlist_songs` queries the `playlist_entries` join table directly to order songs by `position`. |
@@ -91,7 +91,7 @@ if `song.shared_by != added_by`, calls `create_notification(...)` with type
 **3. Friends Listening Now**
 `GET /feed/<user_id>/listening-now` → `feed_service.get_friends_listening_now(user_id)` →
 collects the user's friend IDs → queries `ListeningEvent`s for those friends with
-`listened_at >= now - RECENT_THRESHOLD` (a module-level constant), newest first → walks
+`listened_at` on or after the start of the current UTC day, newest first → walks
 the results keeping only the first (most recent) event per friend → returns
 friend + song + timestamp dicts.
 
