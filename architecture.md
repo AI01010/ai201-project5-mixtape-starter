@@ -19,15 +19,17 @@ HTTP request
                 └─> SQLite (mixtape.db via Flask-SQLAlchemy)
 ```
 
-The routes are deliberately thin — none of them contain logic beyond input validation and
-response shaping. If an endpoint misbehaves, the cause is in the service it delegates to.
+The routes are deliberately thin — beyond input validation and response shaping, the only
+route that touches the database itself is `GET /users/<id>` (it fetches the `User` row
+directly instead of calling a service). If an endpoint misbehaves, the cause is almost
+always in the service it delegates to.
 
 ## File-by-file map
 
 | File | Responsibility |
 |------|----------------|
 | `app.py` | App factory (`create_app`). Configures SQLite, registers the four blueprints under `/songs`, `/playlists`, `/users`, `/feed`, and runs `db.create_all()`. The shared `db = SQLAlchemy()` object lives here, which is why services import `from app import db`. |
-| `models.py` | 7 model classes — `User`, `Tag`, `Song`, `ListeningEvent`, `Rating`, `Playlist`, `Notification` — plus 3 plain association tables: `friendships`, `song_tags`, `playlist_entries`. Each model has a `to_dict()` used by routes for JSON serialization. |
+| `models.py` | 7 model classes — `User`, `Tag`, `Song`, `ListeningEvent`, `Rating`, `Playlist`, `Notification` — plus 3 plain association tables: `friendships`, `song_tags`, `playlist_entries`. Every model except `Tag` has a `to_dict()` used by routes for JSON serialization (tag names are inlined by `Song.to_dict()`). |
 | `routes/songs.py` | `GET /songs/search`, `GET /songs/<id>`, `POST /songs/<id>/rate`, `POST /songs/<id>/listen`. Delegates to search, notification (ratings live there), and streak services. |
 | `routes/playlists.py` | `POST /playlists/`, `GET /playlists/<id>`, `GET /playlists/<id>/songs`, `POST /playlists/<id>/songs`. Delegates to playlist service; adding a song delegates to `notification_service.add_to_playlist`. |
 | `routes/users.py` | `GET /users/<id>`, `GET /users/<id>/streak`, `GET /users/<id>/notifications`, `POST /users/notifications/<id>/read`. |
@@ -56,11 +58,13 @@ response shaping. If an endpoint misbehaves, the cause is in the service it dele
 - **Notification** — `user_id` (recipient), `notification_type` (e.g.
   `song_added_to_playlist`), free-text `body`, `read` flag.
 - **playlist_entries** (association table) — notably carries **extra columns** beyond the
-  two foreign keys: `position` (NOT NULL), `added_by` (NOT NULL), `added_at`. So playlist
-  membership is *ordered and attributed*, not just a set.
+  playlist/song foreign keys: `position` (NOT NULL), `added_by` (NOT NULL, itself a FK to
+  `user.id`), and `added_at`. So playlist membership is *ordered and attributed*, not just
+  a set.
 
-All primary keys are UUID strings. All timestamps default to `datetime.now(timezone.utc)`,
-but SQLite stores them naive — `streak_service` defensively re-attaches UTC with
+All primary keys are UUID strings. Timestamp columns default to
+`datetime.now(timezone.utc)` — the one exception is `User.last_listened_at`, which is
+nullable with no default and is written only by the streak service. SQLite stores them naive — `streak_service` defensively re-attaches UTC with
 `replace(tzinfo=timezone.utc)` before doing date math.
 
 ## Traced data flows
@@ -69,15 +73,16 @@ but SQLite stores them naive — `streak_service` defensively re-attaches UTC wi
 `POST /songs/<song_id>/listen` → `routes/songs.py:listen()` →
 `streak_service.record_listening_event(user_id, song_id)` → inserts a `ListeningEvent`
 with `listened_at=now`, then calls `update_listening_streak(user, now)`, which compares
-`now.date()` against `user.last_listened_at.date()`: same day → no change; consecutive
-day → increment; otherwise → reset to 1. One commit covers both the event and the user
-row. Reading the streak (`GET /users/<id>/streak` → `get_streak`) returns the stored
+`now.date()` against `user.last_listened_at.date()` and applies the streak rules its
+docstring documents: same day → no change; consecutive day → increment; a skipped day →
+reset to 1. One commit covers both the event and the user row. Reading the streak (`GET /users/<id>/streak` → `get_streak`) returns the stored
 integer without recomputing — so a wrong write is visible on every later read.
 
 **2. A friend adds your shared song to a playlist (and you get notified)**
 `POST /playlists/<playlist_id>/songs` → `routes/playlists.py:add_song()` →
 `notification_service.add_to_playlist(playlist_id, song_id, added_by)` → validates song,
-adder, and playlist exist → appends the song to `playlist.songs` if not already present →
+adder, and playlist exist → appends the song to `playlist.songs` if not already present
+(see Sharp edges: a bare append cannot populate the join table's NOT NULL columns) →
 if `song.shared_by != added_by`, calls `create_notification(...)` with type
 `song_added_to_playlist` and a rendered message body. The sharer sees it via
 `GET /users/<id>/notifications` → `get_notifications` (newest first, optional
@@ -92,33 +97,42 @@ friend + song + timestamp dicts.
 
 ## Conventions and patterns
 
-- **Thin routes, fat services.** Every route parses input, calls exactly one service
-  function, and maps `ValueError` to a 400/404 JSON error. Services raise `ValueError`
-  for all not-found/invalid cases.
+- **Thin routes, fat services.** Routes parse input, call a single service function, and
+  map `ValueError` to a 400/404 JSON error; services raise `ValueError` for all
+  not-found/invalid cases. (`GET /users/<id>` is the lone exception — it queries the
+  model directly and builds its own 404.)
 - **Write-time denormalization.** Streaks are stored on `User` and updated when a listen
   is recorded; notification bodies are pre-rendered strings, not references.
-- **Serialization via `to_dict()`** on each model; routes return
+- **Serialization via `to_dict()`** on each model (except `Tag`); routes return
   `jsonify({...})` wrappers with `count` fields for lists.
-- **Association tables are raw `db.Table`s**, not model classes — the seed script and
-  `playlist_service` manipulate them with `db.session.execute(insert()/select())`-style
-  Core access, while other code uses the ORM relationships layered on top of them.
+- **Association tables are raw `db.Table`s**, not model classes — the seed script inserts
+  into them with Core `insert()`, `playlist_service` and `search_service` join against
+  them inside ORM queries, and the rest of the code goes through the ORM relationships
+  layered on top of them.
 
 ## Sharp edges to keep in mind
 
 - `Playlist.songs` is a plain `secondary=playlist_entries` relationship, but the join
   table requires `position` and `added_by` (both NOT NULL) — a bare
-  `playlist.songs.append(song)` has no way to supply those values. Ordered reads therefore
-  bypass the relationship and query the join table directly (`get_playlist_songs`).
+  `playlist.songs.append(song)` has no way to supply those values, so the INSERT it emits
+  violates the NOT NULL constraint (SQLite raises `IntegrityError`, which routes that only
+  catch `ValueError` surface as HTTP 500). Ordered reads therefore bypass the relationship
+  and join the table explicitly (`get_playlist_songs`).
 - Rating logic (`rate_song`) and playlist-add logic (`add_to_playlist`) live in
   `notification_service.py`, not in a songs/playlist service — the module groups "actions
   that may notify someone" together.
-- `song_tags` joins can multiply rows: a `Song` query joined to `song_tags` yields one row
-  per matching tag unless deduplicated.
+- Joining `Song` to `song_tags` multiplies rows at the SQL level (one row per matching
+  tag), but SQLAlchemy's legacy `Query.all()` auto-deduplicates full-entity results via
+  the identity map — so entity queries hide the multiplication, while `query.count()` or
+  2.0-style `session.execute(select(...))` expose it.
 - The streak is only as correct as the last write; there is no recomputation from
   `ListeningEvent` history.
-- Start the app with `flask run` and `FLASK_APP=app:create_app` — running `python app.py`
-  double-imports `app.py` (once as `__main__`, once as `app` via the models' import) and
-  SQLAlchemy errors out.
+- Start the app with `flask --app app:create_app run` (PowerShell equivalent of the
+  README's bash one-liner: `$env:FLASK_APP = "app:create_app"; flask run`). Running
+  `python app.py` imports `app.py` twice — once as `__main__`, once as `app` via the
+  services' `from app import db` import chain — creating a second, never-initialized `db`
+  instance: the server starts fine but every request 500s with "The current Flask app is
+  not registered with this 'SQLAlchemy' instance".
 
 ## Where the five open issues enter the code
 
