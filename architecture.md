@@ -1,0 +1,10 @@
+routes/
+services/
+tests/
+architecture.md
+instructions.md
+app.py
+models.py
+README.md
+requirements.txt
+seed_data.py
